@@ -4,12 +4,13 @@ import java.io.IOException;
 import java.text.DecimalFormat;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
-import org.eclipse.iot.greenhouse.sensors.SensorService;
 import org.eclipse.iot.greenhouse.sensors.SensorChangedListener;
+import org.eclipse.iot.greenhouse.sensors.SensorService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,8 +34,9 @@ public class Pi4JGreenhouseSensorService implements SensorService {
 	private GpioPinDigitalMultipurpose _lightActuator;
 
 	private float _temperatureRef = Float.MIN_VALUE;
+	private float _humidityRef = Float.MIN_VALUE;
 
-	private ScheduledThreadPoolExecutor _scheduledThreadPoolExecutor;
+	//private ScheduledThreadPoolExecutor _scheduledThreadPoolExecutor;
 	private ScheduledFuture<?> _handle;
 
 	protected void activate() {
@@ -49,25 +51,27 @@ public class Pi4JGreenhouseSensorService implements SensorService {
 
 			// monitor temperature changes
 			// every change of more than 0.1C will notify SensorChangedListeners
-			_scheduledThreadPoolExecutor = new ScheduledThreadPoolExecutor(1);
-			_handle = _scheduledThreadPoolExecutor.scheduleAtFixedRate(
-					new Runnable() {
+			ScheduledExecutorService executorService =	Executors.newSingleThreadScheduledExecutor();
+			_handle = executorService.scheduleAtFixedRate(new Runnable() {
 						@Override
 						public void run() {
 							try {
 								float newTemperature = readTemperature();
 								if (Math.abs(_temperatureRef - newTemperature) > .1f) {
-									notifyListeners("temperature",
-											newTemperature);
+									notifyListeners("temperature",newTemperature);
 									_temperatureRef = newTemperature;
+								}
+								float newHumidity = readHumidity();
+								if (Math.abs(_humidityRef - newHumidity) > 2.0f) {
+									notifyListeners("humidity",newHumidity);
+									_humidityRef = newHumidity;
 								}
 							} catch (IOException e) {
 								// TODO Auto-generated catch block
 								e.printStackTrace();
 							}
 						}
-					}, 0, 100, TimeUnit.MILLISECONDS);
-
+					}, 0, 1, TimeUnit.SECONDS);
 		} catch (IOException e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
@@ -101,12 +105,46 @@ public class Pi4JGreenhouseSensorService implements SensorService {
 			} catch (IOException e) {
 				return new NoSuchSensorOrActuatorException();
 			}
+		} else if ("humidity".equals(sensorName)) {
+			try {
+				return readHumidity();
+			} catch (IOException e) {
+				return new NoSuchSensorOrActuatorException();
+			}
 		} else if ("light".equals(sensorName)) {
 			return readLightState();
-		} else
+		} else {
+			s_logger.error("NoSuchSensorOrActuatorException {}", sensorName);
 			throw new SensorService.NoSuchSensorOrActuatorException();
+		}
+			
 	}
+	private synchronized float readHumidity() throws IOException {
+		float humidity;
+		// Set START (D0) in CONFIG to begin a new conversion
+		_temperatureSensor.write(0x03, (byte) 0x01);
 
+		// Poll RDY (D0) in STATUS (register 0) until it is low (=0)
+		int status = -1;
+		while ((status & 0x01) != 0) {
+			status = _temperatureSensor.read(0x00);
+		}
+		// Read the upper and lower bytes of the temperature value from
+		// DATAh and DATAl (registers 0x01 and 0x02), respectively
+		byte[] buffer = new byte[3];
+		_temperatureSensor.read(buffer, 0, 3);
+
+		int dataH = buffer[1] & 0xff;
+		int dataL = buffer[2] & 0xff;
+		//s_logger.info("I2C: [{}, {}]", new Object[] {dataH, dataL} );
+//		float regValue = (dataH<<4) | (dataL>>4);
+//		humidity =(regValue)/16 -24;
+		humidity = (dataH * 256 + dataL) >> 4;
+		humidity =(humidity)/16 -24;
+		DecimalFormat twoDForm = new DecimalFormat("#.##");
+		//s_logger.info("humidity: {}", humidity );
+		return Float.valueOf(twoDForm.format(humidity));
+	}
 	/*
 	 * See sensor documentation here:
 	 * http://www.hoperf.cn/upload/sensor/TH02_V1.1.pdf
@@ -168,6 +206,7 @@ public class Pi4JGreenhouseSensorService implements SensorService {
 
 	private void notifyListeners(String sensorName, Object newValue) {
 		for (SensorChangedListener listener : _listeners) {
+			s_logger.info("about to notify listener {}, new Value {}", sensorName, newValue);
 			listener.sensorChanged(sensorName, newValue);
 		}
 	}
